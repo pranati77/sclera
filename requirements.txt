@@ -3,3 +3,4 @@ scikit-learn
 joblib
 gunicorn
 requests
+opencv-python-headless
