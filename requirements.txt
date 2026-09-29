@@ -4,3 +4,4 @@ joblib
 gunicorn
 requests
 opencv-python-headless
+mediapipe
