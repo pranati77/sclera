@@ -1,7 +1,8 @@
-flask
-scikit-learn
-joblib
-gunicorn
-requests
-opencv-python-headless
-mediapipe
+flask==3.0.3
+scikit-learn==1.4.2
+scikit-image==0.22.0
+numpy==1.26.4
+joblib==1.4.2
+requests==2.31.0
+opencv-python-headless==4.9.0.80
+mediapipe-silicon==0.10.14  # or mediapipe==0.10.14 if compatible
