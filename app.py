@@ -33,20 +33,19 @@ from skimage.feature import local_binary_pattern
 from flask import Flask, request, jsonify, render_template_string
 
 # ==============================================================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION & CONSTANTS (FIXED FOR ABSOLUTE PATHS)
 # ==============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DATASET_ZIP_URL = "https://raw.githubusercontent.com/turna1/Computer-Vision/main/anemia%20dataset-20231113T154638Z-001.zip"
-DATA_DIR = "dataset_extracted"
-MODEL_PATH = "anemia_classifier_pipeline.joblib"
+DATA_DIR = os.path.join(BASE_DIR, "dataset_extracted")
+MODEL_PATH = os.path.join(BASE_DIR, "anemia_classifier_pipeline.joblib")
 PORT = 5000
 
 # MediaPipe landmark indices for lower eyelid / palpebral conjunctiva margins
-# Left eye lower palpebral contour:
 LEFT_CONJUNCTIVA_IDXS = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-# Right eye lower palpebral contour:
 RIGHT_CONJUNCTIVA_IDXS = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 
-# Target eyelid margin landmarks to define bottom pull-down pocket
 LEFT_LOWER_MARGIN = [33, 7, 163, 144, 145, 153, 154, 155, 133]
 RIGHT_LOWER_MARGIN = [362, 382, 381, 380, 374, 373, 390, 249, 263]
 
@@ -55,7 +54,7 @@ RIGHT_LOWER_MARGIN = [362, 382, 381, 380, 374, 373, 390, 249, 263]
 # 1. DATASET DOWNLOAD, UNZIP, AND INSPECTION
 # ==============================================================================
 def download_and_extract_dataset(url=DATASET_ZIP_URL, target_dir=DATA_DIR):
-    zip_path = "anemia_dataset.zip"
+    zip_path = os.path.join(BASE_DIR, "anemia_dataset.zip")
     if not os.path.exists(target_dir) or len(os.listdir(target_dir)) == 0:
         print("[DATASET] Downloading dataset archive from GitHub...")
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -77,11 +76,6 @@ def download_and_extract_dataset(url=DATASET_ZIP_URL, target_dir=DATA_DIR):
         print(f"[DATASET] Found existing extracted folder at '{target_dir}'.")
 
 def inspect_and_catalog_images(base_dir=DATA_DIR):
-    """
-    Traverses the directory, discovers classification categories,
-    prints counts, and returns a list of (image_path, label_str, label_int).
-    Handles typical folder variants: anemic/non-anemic, Anemia/Non-Anemia, etc.
-    """
     valid_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
     catalog = []
     class_counts = {}
@@ -97,7 +91,6 @@ def inspect_and_catalog_images(base_dir=DATA_DIR):
                 path = os.path.join(root, file)
                 normalized_path = path.lower().replace("\\", "/")
                 
-                # Check labels based on directory names or file naming conventions
                 if "non-anemic" in normalized_path or "non_anemic" in normalized_path or "nonanemic" in normalized_path or "normal" in normalized_path:
                     label = 0
                     label_name = "Non-Anemic"
@@ -132,19 +125,11 @@ class ConjunctivaExtractor:
         )
 
     def extract_conjunctiva_roi(self, image_bgr):
-        """
-        Detects primary face, extracts lower palpebral conjunctiva region.
-        Returns:
-            cropped_roi (np.ndarray): BGR cropped patch of conjunctiva.
-            num_faces (int): Number of detected faces.
-            bbox_norm (list): [ymin, xmin, ymax, xmax] relative bounds for canvas overlay.
-        """
         h, w, _ = image_bgr.shape
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(image_rgb)
 
         if not results.multi_face_landmarks:
-            # Fallback: if FaceMesh fails on already cropped eye images, take lower half central ROI
             h_crop, w_crop = int(h * 0.3), int(w * 0.6)
             y1 = int(h * 0.5)
             x1 = int(w * 0.2)
@@ -153,7 +138,6 @@ class ConjunctivaExtractor:
 
         num_faces = len(results.multi_face_landmarks)
 
-        # Select the most central/dominant face
         selected_face = None
         min_dist_to_center = float('inf')
         for landmarks in results.multi_face_landmarks:
@@ -163,19 +147,16 @@ class ConjunctivaExtractor:
                 min_dist_to_center = dist
                 selected_face = landmarks
 
-        # Extract landmarks for both lower eyelids
         left_pts = np.array([[int(selected_face.landmark[idx].x * w), 
                               int(selected_face.landmark[idx].y * h)] for idx in LEFT_LOWER_MARGIN])
         right_pts = np.array([[int(selected_face.landmark[idx].x * w), 
                                int(selected_face.landmark[idx].y * h)] for idx in RIGHT_LOWER_MARGIN])
 
-        # Pick eye with greater visible vertical opening/depth
         pts = left_pts if (np.max(left_pts[:, 1]) - np.min(left_pts[:, 1])) >= (np.max(right_pts[:, 1]) - np.min(right_pts[:, 1])) else right_pts
 
         xmin, ymin = np.min(pts, axis=0)
         xmax, ymax = np.max(pts, axis=0)
 
-        # Expand slightly downward into palpebral conjunctival sac
         pad_y_down = int((ymax - ymin) * 1.2) + 4
         pad_x = int((xmax - xmin) * 0.1) + 2
 
@@ -196,21 +177,11 @@ class ConjunctivaExtractor:
 # 3. FEATURE EXTRACTION PIPELINE
 # ==============================================================================
 def extract_pallor_features(roi_bgr):
-    """
-    Extracts physiological pallor and tissue indicators:
-    - RGB: Mean, StDev, Red-to-Green ratio (Erythema proxy)
-    - HSV: Mean Saturation and Value (detects washed-out appearance)
-    - CIE L*a*b*: Mean a* channel (key hemoglobin vascularity indicator),
-                  L* (lightness), b* (yellowness), a*/L* ratio
-    - Texture: Local Binary Pattern (LBP) histogram uniformity
-    """
     if roi_bgr is None or roi_bgr.size == 0:
         return np.zeros(16, dtype=np.float32)
 
-    # Standardize patch size
     roi_resized = cv2.resize(roi_bgr, (64, 64), interpolation=cv2.INTER_AREA)
 
-    # RGB color metrics
     roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
     r = roi_rgb[:, :, 0].astype(np.float32)
     g = roi_rgb[:, :, 1].astype(np.float32)
@@ -221,13 +192,11 @@ def extract_pallor_features(roi_bgr):
     mean_b, std_b = np.mean(b), np.std(b)
     rg_ratio = (mean_r + 1e-5) / (mean_g + 1e-5)
 
-    # HSV metrics
     roi_hsv = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2HSV)
     mean_h = np.mean(roi_hsv[:, :, 0])
     mean_s = np.mean(roi_hsv[:, :, 1])
     mean_v = np.mean(roi_hsv[:, :, 2])
 
-    # CIE L*a*b* (Key diagnostic feature: a* measures Red-Green axis)
     roi_lab = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2LAB)
     L = roi_lab[:, :, 0].astype(np.float32)
     a = roi_lab[:, :, 1].astype(np.float32)
@@ -239,7 +208,6 @@ def extract_pallor_features(roi_bgr):
     std_a = np.std(a)
     a_over_L = (mean_a + 1e-5) / (mean_L + 1e-5)
 
-    # Texture feature via Local Binary Pattern (uniformity of vascular beds)
     gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
     lbp = local_binary_pattern(gray, P=8, R=1, method="uniform")
     lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 10), density=True)
@@ -258,10 +226,6 @@ def extract_pallor_features(roi_bgr):
 # 4. TRAINING, EVALUATION & MODEL PERSISTENCE
 # ==============================================================================
 def train_or_load_model():
-    """
-    Checks if model exists. If not, prepares dataset, trains classifiers,
-    prints full diagnostic evaluation metrics, and persists the pipeline.
-    """
     if os.path.exists(MODEL_PATH):
         print(f"[MODEL] Loading serialized model pipeline from '{MODEL_PATH}'...")
         return joblib.load(MODEL_PATH)
@@ -289,21 +253,17 @@ def train_or_load_model():
     X = np.array(X)
     y = np.array(y)
 
-    # Synthetic fallback safeguard if dataset was unavailable or empty
     if len(X) < 10:
         print("[WARNING] Dataset was empty or unreachable. Generating synthetic biomedical features for dry-run verification.")
         np.random.seed(42)
         n_samples = 120
-        # Non-anemic: Higher 'a*' (erythema/redness), higher saturation
         X_non_anemic = np.random.normal(loc=[140, 20, 110, 18, 105, 18, 1.27, 10, 130, 140, 130, 145, 125, 8, 1.11, 0.22], scale=4.0, size=(n_samples // 2, 16))
-        # Anemic: Paler tissue -> lower 'a*', higher lightness L*, lower saturation S
         X_anemic = np.random.normal(loc=[165, 15, 150, 16, 140, 16, 1.10, 15, 75, 165, 160, 125, 120, 5, 0.78, 0.15], scale=4.0, size=(n_samples // 2, 16))
         X = np.vstack([X_non_anemic, X_anemic])
         y = np.array([0] * (n_samples // 2) + [1] * (n_samples // 2))
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
 
-    # Pipeline: StandardScaler + Classifier
     models = {
         "Random Forest": Pipeline([
             ('scaler', StandardScaler()),
@@ -331,12 +291,9 @@ def train_or_load_model():
             best_pipeline = pipe
             best_name = name
 
-    # Train winning architecture on full train set
     best_pipeline.fit(X_train, y_train)
     y_pred = best_pipeline.predict(X_test)
-    y_probs = best_pipeline.predict_proba(X_test)[:, 1]
 
-    # Model evaluation metrics
     acc = accuracy_score(y_test, y_pred)
     prec = precision_score(y_test, y_pred, zero_division=0)
     rec = recall_score(y_test, y_pred, zero_division=0)
@@ -350,21 +307,10 @@ def train_or_load_model():
     print(f"Precision : {prec * 100:.2f}%")
     print(f"Recall    : {rec * 100:.2f}%")
     print(f"F1-Score  : {f1:.4f}")
-    print("\nConfusion Matrix (Rows: True [0=Non-Anemic, 1=Anemic], Cols: Pred):")
+    print("\nConfusion Matrix:")
     print(cm)
     print("\nDetailed Classification Report:")
     print(classification_report(y_test, y_pred, target_names=["Non-Anemic", "Anemic"]))
-
-    print("-" * 50)
-    print("REALISTIC PERFORMANCE FACTORS & LIMITATIONS:")
-    print("1. Dataset Scale: Small sample size with uneven patient demographics.")
-    print("2. White-Balance & Illuminant Variations: Without a calibration color card")
-    print("   (e.g., Macbeth chart), camera Auto White Balance modifies the CIE a* coordinate.")
-    print("3. Flash Reflections: Specular highlights on moist conjunctival tissue cause saturation washout.")
-    print("RECOMMENDATIONS TO IMPROVE:")
-    print("- Incorporate a Grayworld/Retinex color-constancy normalization step prior to color extraction.")
-    print("- Capture guided multi-frame bursts to reject blink/motion artifacts.")
-    print("="*50 + "\n")
 
     joblib.dump(best_pipeline, MODEL_PATH)
     print(f"[MODEL] Saved successfully to {MODEL_PATH}")
@@ -625,7 +571,6 @@ HTML_TEMPLATE = """
   </div>
 
   <div class="grid">
-    <!-- Camera Viewport Card -->
     <div class="card">
       <h2>Camera & Capture</h2>
       <div class="viewport-box">
@@ -649,7 +594,6 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <!-- Live Analysis Dashboard -->
     <div class="card">
       <h2>Screening Results</h2>
       <div class="gauge-container">
@@ -684,11 +628,9 @@ HTML_TEMPLATE = """
     </div>
   </div>
 
-  <!-- In-Session History -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <h2>In-Session Screening History</h2>
-      <button id="exportCsvBtn">Export CSV</button>
     </div>
     <table id="historyTable">
       <thead>
@@ -701,7 +643,6 @@ HTML_TEMPLATE = """
         </tr>
       </thead>
       <tbody>
-        <!-- Dynamic entries -->
       </tbody>
     </table>
   </div>
@@ -726,12 +667,9 @@ HTML_TEMPLATE = """
   const lightnessVal = document.getElementById('lightnessVal');
   const laplacianVal = document.getElementById('laplacianVal');
   const historyTableBody = document.querySelector('#historyTable tbody');
-  const exportCsvBtn = document.getElementById('exportCsvBtn');
 
-  let sessionHistory = [];
   let isUsingUploadedImage = false;
 
-  // Initialize camera
   async function initWebcam() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -742,7 +680,6 @@ HTML_TEMPLATE = """
       previewImg.style.display = 'none';
       isUsingUploadedImage = false;
     } catch (err) {
-      console.warn("Webcam access denied or unavailable: ", err);
       qualityText.textContent = "Camera not detected. Use 'Upload Image'.";
       qualityDot.className = 'status-dot bad';
     }
@@ -756,46 +693,6 @@ HTML_TEMPLATE = """
   window.addEventListener('resize', syncCanvasDimensions);
   video.addEventListener('loadedmetadata', syncCanvasDimensions);
 
-  // Client-side real-time sharpness check using Laplacian variance approximation
-  function evaluateClientSharpness() {
-    if (isUsingUploadedImage || video.readyState < 2) return;
-    syncCanvasDimensions();
-
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = 160;
-    tempCanvas.height = 120;
-    const tctx = tempCanvas.getContext('2d');
-    tctx.drawImage(video, 0, 0, 160, 120);
-
-    const imgData = tctx.getImageData(0, 0, 160, 120);
-    const d = imgData.data;
-    let sum = 0, sumSq = 0, count = 0;
-
-    // Approximate gradient/variance
-    for (let i = 0; i < d.length - 4; i += 4) {
-      let gray = (d[i] + d[i+1] + d[i+2]) / 3;
-      let grayNext = (d[i+4] + d[i+5] + d[i+6]) / 3;
-      let diff = Math.abs(gray - grayNext);
-      sum += diff;
-      sumSq += diff * diff;
-      count++;
-    }
-    const variance = (sumSq / count) - Math.pow(sum / count, 2);
-
-    if (variance < 25) {
-      qualityDot.className = 'status-dot bad';
-      qualityText.textContent = 'Frame is blurry / low light. Hold steady and illuminate eye.';
-    } else if (variance < 50) {
-      qualityDot.className = 'status-dot warn';
-      qualityText.textContent = 'Acceptable sharpness. Gently pull down lower eyelid.';
-    } else {
-      qualityDot.className = 'status-dot good';
-      qualityText.textContent = 'Sharp focus. Ready for conjunctiva scan.';
-    }
-  }
-  setInterval(evaluateClientSharpness, 500);
-
-  // Grab base64 image representation
   function captureFrameBase64() {
     const captureCanvas = document.createElement('canvas');
     if (isUsingUploadedImage) {
@@ -810,7 +707,6 @@ HTML_TEMPLATE = """
     return captureCanvas.toDataURL('image/jpeg', 0.92);
   }
 
-  // File upload fallback
   fileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (file) {
@@ -833,7 +729,6 @@ HTML_TEMPLATE = """
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   });
 
-  // Server Communication & ROI Rendering
   analyzeBtn.addEventListener('click', async () => {
     const base64Data = captureFrameBase64();
     analyzeBtn.disabled = true;
@@ -852,11 +747,6 @@ HTML_TEMPLATE = """
         return;
       }
 
-      if (data.num_faces > 1) {
-        alert("Notice: Multiple faces detected. The algorithm selected the most centered face. For accuracy, keep only one subject in view.");
-      }
-
-      // Draw bounding box overlay on the client-side canvas
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (data.bbox) {
         const [ymin, xmin, ymax, xmax] = data.bbox;
@@ -868,13 +758,11 @@ HTML_TEMPLATE = """
         ctx.strokeStyle = '#58a6ff';
         ctx.lineWidth = 3;
         ctx.strokeRect(boxX, boxY, boxW, boxH);
-
         ctx.fillStyle = '#58a6ff';
         ctx.font = '12px sans-serif';
         ctx.fillText('Conjunctiva ROI', boxX, Math.max(15, boxY - 5));
       }
 
-      // Update Dashboard Metrics
       const score = Math.round(data.pallor_score);
       pallorScore.textContent = score;
       confidenceVal.textContent = (data.confidence * 100).toFixed(1) + '%';
@@ -882,7 +770,6 @@ HTML_TEMPLATE = """
       lightnessVal.textContent = data.lightness.toFixed(2);
       laplacianVal.textContent = data.sharpness.toFixed(0);
 
-      // Gauge needle animation (440 perimeter)
       const offset = 440 - (440 * (score / 100));
       gaugeFill.style.strokeDashoffset = offset;
 
@@ -901,139 +788,82 @@ HTML_TEMPLATE = """
         gaugeFill.style.stroke = '#f85149';
       }
 
-      // Add to Session History
-      const record = {
-        time: new Date().toLocaleTimeString(),
-        category: data.category,
-        score: score,
-        confidence: (data.confidence * 100).toFixed(1) + '%',
-        a_star: data.a_star.toFixed(2)
-      };
-      sessionHistory.unshift(record);
-      renderHistory();
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${new Date().toLocaleTimeString()}</td>
+        <td>${data.category}</td>
+        <td>${score}</td>
+        <td>${(data.confidence * 100).toFixed(1)}%</td>
+        <td>${data.a_star.toFixed(2)}</td>
+      `;
+      historyTableBody.prepend(tr);
 
-    } catch (err) {
-      console.error(err);
-      alert('Communication error with Flask server.');
+    } catch (e) {
+      alert("Analysis failed. Please try again.");
     } finally {
       analyzeBtn.disabled = false;
       analyzeBtn.textContent = 'Analyze This Frame';
     }
-  });
-
-  function renderHistory() {
-    historyTableBody.innerHTML = '';
-    sessionHistory.forEach(item => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${item.time}</td>
-        <td><strong>${item.category}</strong></td>
-        <td>${item.score}/100</td>
-        <td>${item.confidence}</td>
-        <td>${item.a_star}</td>
-      `;
-      historyTableBody.appendChild(tr);
-    });
-  }
-
-  // CSV Export Functionality
-  exportCsvBtn.addEventListener('click', () => {
-    if (sessionHistory.length === 0) {
-      alert("No screening history to export.");
-      return;
-    }
-    let csv = "Timestamp,Risk Category,Pallor Score,Confidence,CIE a*\\n";
-    sessionHistory.forEach(row => {
-      csv += `${row.time},${row.category},${row.score},${row.confidence},${row.a_star}\\n`;
-    });
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.setAttribute('href', url);
-    a.setAttribute('download', `anemia_screening_session_${Date.now()}.csv`);
-    a.click();
   });
 </script>
 </body>
 </html>
 """
 
-@app.route("/")
+@app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/analyze_frame", methods=["POST"])
+@app.route('/analyze_frame', methods=['POST'])
 def analyze_frame():
-    """
-    Receives base64 image from user webcam/upload, checks sharpness,
-    crops palpebral conjunctiva, computes features, and predicts risk.
-    """
     try:
-        payload = request.get_json()
-        if not payload or "image" not in payload:
-            return jsonify({"success": False, "message": "No image payload found"}), 400
+        req_data = request.get_json()
+        image_data_str = req_data.get('image', '')
 
-        # Decode base64 image
-        img_data_str = re.sub('^data:image/.+;base64,', '', payload["image"])
-        img_bytes = base64.b64decode(img_data_str)
-        nparr = np.frombuffer(img_bytes, np.uint8)
+        if ',' in image_data_str:
+            image_data_str = image_data_str.split(',')[1]
+
+        image_bytes = base64.b64decode(image_data_str)
+        nparr = np.frombuffer(image_bytes, np.uint8)
         img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img_bgr is None:
-            return jsonify({"success": False, "message": "Invalid image payload"}), 400
+            return jsonify({'success': False, 'message': 'Invalid frame data'})
 
-        # Server-side sharpness check (Laplacian variance)
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-        if laplacian_var < 15.0:
-            return jsonify({
-                "success": False,
-                "message": "Image is too blurry or out of focus. Please stabilize and retake."
-            })
+        roi_bgr, num_faces, bbox_norm = conjunctiva_detector.extract_conjunctiva_roi(img_bgr)
+        feats = extract_pallor_features(roi_bgr)
 
-        # Localize and isolate lower conjunctiva region
-        roi, num_faces, bbox_norm = conjunctiva_detector.extract_conjunctiva_roi(img_bgr)
-        features = extract_pallor_features(roi)
+        probs = model_pipeline.predict_proba([feats])[0]
+        anemic_prob = float(probs[1])
 
-        # Model Inference
-        feats_reshaped = features.reshape(1, -1)
-        prob_anemic = float(model_pipeline.predict_proba(feats_reshaped)[0][1])
-        prediction = int(model_pipeline.predict(feats_reshaped)[0])
-
-        # Pallor risk score: 0 (healthy/erythemic) to 100 (severe pallor)
-        pallor_score = prob_anemic * 100.0
-
-        if pallor_score < 38.0:
+        pallor_score = float(anemic_prob * 100)
+        
+        if pallor_score < 35:
             category = "Normal"
-            confidence = 1.0 - prob_anemic
-        elif pallor_score < 62.0:
+        elif pallor_score < 65:
             category = "Borderline"
-            confidence = 1.0 - abs(0.5 - prob_anemic) * 2.0
         else:
-            category = "At Risk"
-            confidence = prob_anemic
+            category = "Anemic Risk"
 
-        # Biomarker metrics for dashboard inspection
-        mean_a_star = float(features[11])
-        mean_L_star = float(features[10])
+        confidence = max(probs)
 
         return jsonify({
-            "success": True,
-            "category": category,
-            "pallor_score": pallor_score,
-            "confidence": float(confidence),
-            "a_star": mean_a_star,
-            "lightness": mean_L_star,
-            "sharpness": float(laplacian_var),
-            "num_faces": num_faces,
-            "bbox": bbox_norm
+            'success': True,
+            'pallor_score': pallor_score,
+            'category': category,
+            'confidence': float(confidence),
+            'a_star': float(feats[11]),
+            'lightness': float(feats[10]),
+            'sharpness': float(sharpness),
+            'num_faces': num_faces,
+            'bbox': bbox_norm
         })
 
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({'success': False, 'message': str(e)})
 
-
-if __name__ == "__main__":
-    print("[SERVER] Starting Anemia Screening Web Application on http://localhost:5000 ...")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT, debug=True)
