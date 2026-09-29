@@ -5,4 +5,4 @@ numpy==1.26.4
 joblib==1.4.2
 requests==2.31.0
 opencv-python-headless==4.9.0.80
-mediapipe-silicon==0.10.14  # or mediapipe==0.10.14 if compatible
+mediapipe==0.10.14
